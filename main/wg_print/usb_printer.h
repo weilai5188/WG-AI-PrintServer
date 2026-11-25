@@ -2,6 +2,7 @@
 #define USB_PRINTER_H
 
 #include "print_compat.h"
+#include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include "usb/usb_host.h"
@@ -186,6 +187,7 @@ public:
   bool          hasError() const { return _portStatusValid && !(_portStatus & PS_NOT_ERROR); }
   String        getStatusText() const;
   String        getStateText() const;
+  const char* getInitStage() const { return _initStage.load(); }
 
   uint32_t getTxErrors() const { return _txErrors; }
   // v2.9.7：char[] 而不是 String——多个任务（打印/IPP/usbip 写，Web 读）并发，
@@ -197,6 +199,7 @@ public:
   uint32_t getLeakedXfers() const { return _leakedXfers; }
 
 private:
+  std::atomic<const char*> _initStage{"waiting-device"};
   PrinterState _state;
   UsbInfo      _ui;
   PrinterInfo  _pi;

@@ -55,8 +55,11 @@ static const PrinterProfile PROFILES[] = {
   {0x04B8, 0x0005, "Epson Stylus Photo 1390",
    Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
 
-  // WG P2: L1300 experimental transparent stream policy; keep Device ID and IN enabled.
-  {0x04B8, 0x0066, nullptr, Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
+  // WG P2.1: known identity from actual L1300 enumeration. Skip optional EP0
+  // probes during diagnosis; keep Bulk IN. No injected bytes or recovery replay.
+  // This is an experimental compatibility profile, not a validated device policy.
+  {0x04B8, 0x0066, "EPSON L1300 Series",
+   Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP | Q_NO_TEXT_TESTPAGE},
 
   // ---- HP ---------------------------------------------------------------
   // 03F0:622A（装 HP LaserJet MFP M129-M134 PCLm-S 驱动）实测：

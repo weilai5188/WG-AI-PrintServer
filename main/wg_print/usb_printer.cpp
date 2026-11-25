@@ -193,6 +193,7 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
   switch (m->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
       Serial.printf("[USB] 检测到新设备，地址 %d\n", m->new_dev.address);
+      _initStage.store("new-dev");
       markStage("new-dev", __LINE__);
       // 仅置标志，真正打开延后到 task() 循环里做。
       // 原因：本回调由 usb_host_client_handle_events() 内部触发，若在此直接同步
@@ -206,6 +207,7 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
       break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
       Serial.println("[USB] 设备已拔出");
+      _initStage.store("dev-gone");
       markStage("dev-gone", __LINE__);
       if (m->dev_gone.dev_hdl != _deviceHandle) break;
       _closing = true;
@@ -221,15 +223,18 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
 // ---------------------------------------------------------------
 bool UsbPrinter::_openDevice(uint8_t devAddr) {
   if (_deviceHandle != nullptr || _closing) return false;
+  _initStage.store("open-start");
   markStage("open-start", __LINE__);
   esp_err_t err = usb_host_device_open(_clientHandle, devAddr, &_deviceHandle);
   if (err != ESP_OK) {
     _ui.lastError = (int)err;
+    _initStage.store("open-fail");
     Serial.printf("[USB] 打开设备失败: %s\n", esp_err_to_name(err));
     return false;
   }
 
   _state = PRINTER_CONNECTED;
+  _initStage.store("open-ok");
   markStage("open-ok", __LINE__);
   _ui.enumCount++;
   _ui.lastError = 0;
@@ -257,9 +262,11 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
     Serial.printf("[USB] addr=%d VID=0x%04X PID=0x%04X bcdUSB=0x%04X\n",
                   devAddr, _ui.vid, _ui.pid, _ui.bcdUsb);
   } else {
+    _initStage.store("desc-fail");
     _closeDevice();
     return false;
   }
+  _initStage.store("desc-ok");
   markStage("desc-ok", __LINE__);
 
   // 字符串描述符缓存清空。真正的身份识别放到 claim 接口之后，
@@ -268,23 +275,29 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
 
   if (!_findPrinterInterface()) {
     Serial.println("[USB] 未找到打印机类接口（可能不是打印机，或走厂商私有协议）");
-    markStage("iface-fail", __LINE__);
+    _initStage.store("iface-fail");
+  markStage("iface-fail", __LINE__);
     _closeDevice();
     return false;
   }
+  _initStage.store("iface-ok");
   markStage("iface-ok", __LINE__);
 
   if (!_claimInterface()) {
-    markStage("claim-fail", __LINE__);
+    _initStage.store("claim-fail");
+  markStage("claim-fail", __LINE__);
     _closeDevice();
     return false;
   }
+  _initStage.store("claim-ok");
   markStage("claim-ok", __LINE__);
 
   // 身份识别统一放在 claim 接口之后：GET_DEVICE_ID 的 wIndex 需要接口号。
   // 顺序很关键 —— 旧实现先读字符串描述符，打印机一 NAK 就置 _ctrlHung，
   // 导致后面真正能拿到型号的 Device ID 请求被直接跳过。改为统一入口。
+  _initStage.store("identity-start");
   _resolveIdentity();
+  _initStage.store("ident-ok");
   markStage("ident-ok", __LINE__);
 
 #if ENABLE_PORT_STATUS_POLL
@@ -293,6 +306,7 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
 #else
   _portPollDisabled = true;   // raw 打印不需要 IEEE1284 状态，默认不碰这个可选请求
 #endif
+  _initStage.store("port-ok");
   markStage("port-ok", __LINE__);
 
   // 身份识别/状态查询会派发事件，期间拔出时不能再回写 READY。
@@ -300,10 +314,13 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
     _closeDevice();
     return false;
   }
+  _initStage.store("bulk-in-start");
   _startInStream();           // 开启 IN 回读（没有 IN 端点的单向机自动跳过）
+  _initStage.store("in-ok");
   markStage("in-ok", __LINE__);
 
   _state = PRINTER_READY;
+  _initStage.store("ready");
   markStage("ready", __LINE__);
   Serial.printf("[USB] 打印机就绪: %s %s\n", _pi.mfg.c_str(), _pi.mdl.c_str());
   return true;
@@ -883,7 +900,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
     return -2;
   }
 
-  if (!_deviceHandle || !_epOut || _closing || _closePending || _bulkXfer || _inStreamSuspended) {
+  if (_state != PRINTER_READY || !_deviceHandle || !_epOut || _closing || _closePending || _bulkXfer || _inStreamSuspended) {
     xSemaphoreGive(_usbLock);
     return -1;
   }
@@ -1090,7 +1107,7 @@ bool UsbPrinter::recover() {
 #if !USB_RECOVER_ENABLED
   return false;
 #else
-  if (_deviceHandle == nullptr || _usbLock == nullptr) return false;
+  if (!failRecoverAllowed() || _deviceHandle == nullptr || _usbLock == nullptr) return false;
   if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
   bool ok = _recoverLocked();
   xSemaphoreGive(_usbLock);

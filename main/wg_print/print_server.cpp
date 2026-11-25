@@ -430,11 +430,16 @@ void PrintServer::task() {
 //   固件侧 0.57 秒就记账 "已完成 35.9 KB"，客户端却 45~90 秒收不到 FIN；
 //   Spooler 认为作业仍在打印，后续任务全堆在队列里等 TCP 超时。
 void PrintServer::_finishJobSuccess() {
+  if (_currentJob.bytesReceived == 0) {
+    _currentJob.active = false;
+    if (_clientAlive()) _closeClient();
+    return;
+  }
   unsigned long ms = millis() - _currentJob.startTime;
   _lastJobMs = ms;
   snprintf(_lastJob, sizeof(_lastJob),
-           "已完成 %.1f KB，用时 %.1f 秒，来自 %s",
-           _currentJob.bytesReceived / 1024.0, ms / 1000.0, _currentJob.clientIP);
+           "已完成 %u 字节，用时 %lu ms，来自 %s",
+           (unsigned)_currentJob.bytesReceived, ms, _currentJob.clientIP);
   _totalJobs++;
   _totalBytes += _currentJob.bytesReceived;
   _currentJob.active = false;
@@ -646,8 +651,10 @@ void PrintServer::_abortJob(const String& reason) {
   }
   // 作业被掐断 = 打印机里还留着半截数据流。不主动收尸的话它会一直 NAK 批量 OUT，
   // 下一个作业照样打不进去 —— 过去只能让用户拔电。先自愈，再补复位序列。
-  _printer.recover();
-  _resetPrinter();
+  if (!_printer.passthrough()) {
+    _printer.recover();
+    _resetPrinter();
+  }
   // v2.6.3：失败也走优雅关闭。让客户端立刻读到 FIN，才能马上结束这次尝试
   // 而不是挂在 TCP 超时上 —— 否则 Windows 会把它算成"作业还在跑"，
   // 队列里的下一份迟迟提交不上来。
@@ -839,17 +846,21 @@ void PrintServer::_publishDiag(const char* phase, bool force) {
   const auto& u = _printer.getUsbInfo();
   char b[1600];
   snprintf(b, sizeof(b),
-      "WG AI Print P2\n阶段: %s\nIP: %s\n打印机: %s\nUSB: %s %04X:%04X, 枚举 %u\n"
+      "WG AI Print P2.1\n阶段: %s\nIP: %s\n打印机: %s\nUSB: %s %04X:%04X, 枚举 %u\n"
+      "USB 初始化阶段: %s\nEP0 挂起: %s\nBulk IN: %s\nUSB OUT/IN: %02X/%02X\n纯透传: %s\n"
       "作业: %s\nTCP 已接收: %u B\nUSB 已发送(已知确认): %u B\nTCP 已回传: %u B\n"
       "作业已用时: %lu ms\n距最后 USB 成功: %lu ms\nUSB 错误: %u\n自动恢复: %u\n待回收传输: %u\n"
-      "缓冲分配: %u B (单块 %u B)\n回传暂存: %u B\n累计成功: %u\n累计失败: %u\n拒绝连接: %u\n最近作业: %s\nUSB 最近错误: %s\n",
+      "缓冲分配: %u B (单块 %u B)\n回传暂存: %u B\n累计成功: %u\n累计失败: %u\n拒绝连接: %u\n最近作业: %s\nUSB 最近错误: %s\nTCP 作业头(HEX): %s\nTCP 作业尾(HEX): %s\n",
       phase, WiFi.localIP().toString().c_str(), pi.mdl.c_str(), _printer.getStateText().c_str(),
       (unsigned)u.vid, (unsigned)u.pid, (unsigned)u.enumCount,
+      _printer.getInitStage(), _printer.isCtrlHung() ? "yes" : "no",
+      _printer.isBidirActive() ? "active" : (_printer.isBidirStalled() ? "stalled" : "idle"),
+      (unsigned)u.epOut, (unsigned)u.epIn, _printer.passthrough() ? "yes" : "no",
       _currentJob.active ? "active" : "idle", (unsigned)_currentJob.bytesReceived,
       (unsigned)_currentJob.bytesSent, (unsigned)_currentJob.bytesReturned,
-      _currentJob.startTime ? now - _currentJob.startTime : 0UL, _lastSentMs ? now - _lastSentMs : 0UL,
+      _currentJob.active ? now - _currentJob.startTime : 0UL, _lastSentMs ? now - _lastSentMs : 0UL,
       (unsigned)_printer.getTxErrors(), (unsigned)_printer.getRecoverCount(), (unsigned)_printer.getLeakedXfers(),
       (unsigned)_bufferSize, (unsigned)PRINT_CHUNK, (unsigned)(_backLen - _backOffset),
-      (unsigned)_totalJobs, (unsigned)_failedJobs, (unsigned)_rejectedCount, _lastJob, _printer.getLastError().c_str());
+      (unsigned)_totalJobs, (unsigned)_failedJobs, (unsigned)_rejectedCount, _lastJob, _printer.getLastError().c_str(), getJobHeadHex().c_str(), getJobTailHex().c_str());
   WgPrintDiagPublish(b);
 }
