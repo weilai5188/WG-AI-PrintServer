@@ -210,7 +210,7 @@ private:
   SemaphoreHandle_t _infoLock = nullptr;   // 保护 _pi（跨任务读取）
   void          _setLastError(const String& s) {
     size_t n = s.length() < sizeof(_lastErrorBuf) - 1 ? s.length() : sizeof(_lastErrorBuf) - 1;
-    for (size_t i = 0; i < n; i++) _lastErrorBuf[i] = s[i];
+    for (size_t i = 0; i < n; i++) _lastErrorBuf[i] = s.c_str()[i];
     _lastErrorBuf[n] = 0;
   }
 
