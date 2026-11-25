@@ -188,6 +188,13 @@ public:
   String        getStatusText() const;
   String        getStateText() const;
   const char* getInitStage() const { return _initStage.load(); }
+  uint32_t getHostPumps() const { return _hostPumps.load(); }
+  uint32_t getNewEvents() const { return _newEvents.load(); }
+  uint32_t getGoneEvents() const { return _goneEvents.load(); }
+  int getListedDevices() const { return _listedDevices.load(); }
+  int getListResult() const { return _listResult.load(); }
+  int getLibError() const { return _libError.load(); }
+  int getClientError() const { return _clientError.load(); }
 
   uint32_t getTxErrors() const { return _txErrors; }
   // v2.9.7：char[] 而不是 String——多个任务（打印/IPP/usbip 写，Web 读）并发，
@@ -200,6 +207,9 @@ public:
 
 private:
   std::atomic<const char*> _initStage{"waiting-device"};
+  std::atomic<uint32_t> _hostPumps{0}, _newEvents{0}, _goneEvents{0};
+  std::atomic<int> _listedDevices{-1}, _listResult{0}, _libError{0}, _clientError{0};
+  unsigned long _lastDeviceScanMs = 0;
   PrinterState _state;
   UsbInfo      _ui;
   PrinterInfo  _pi;

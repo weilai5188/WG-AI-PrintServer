@@ -119,9 +119,33 @@ void UsbPrinter::task() {
   // 关闭重试也要推进库事件与 client 回调，否则拔出/取消完成可能无法收敛。
   uint32_t evFlags = 0;
   markStageQ("ev-lib", __LINE__);
-  usb_host_lib_handle_events(0, &evFlags);
+  esp_err_t libRc = usb_host_lib_handle_events(0, &evFlags);
   markStageQ("ev-cli", __LINE__);
-  usb_host_client_handle_events(_clientHandle, 0);
+  esp_err_t cliRc = usb_host_client_handle_events(_clientHandle, 0);
+  _hostPumps.fetch_add(1);
+  if (libRc != ESP_OK && libRc != ESP_ERR_TIMEOUT) _libError.store(libRc);
+  if (cliRc != ESP_OK && cliRc != ESP_ERR_TIMEOUT) _clientError.store(cliRc);
+
+  // ESP-IDF also supports discovering already enumerated devices. Do not
+  // depend solely on NEW_DEV, and never reopen while a device is owned.
+  // All calls remain under the same USB mutex as the upstream event pump.
+  unsigned long scanNow = millis();
+  if (!_otaClosePending && !_closing && !_closePending && !_openPending &&
+      !_deviceHandle && _state == PRINTER_DISCONNECTED &&
+      scanNow - _lastDeviceScanMs >= 1000) {
+    _lastDeviceScanMs = scanNow;
+    uint8_t addresses[8] = {};
+    int count = 0;
+    esp_err_t rc = usb_host_device_addr_list_fill(8, addresses, &count);
+    _listResult.store(rc);
+    _listedDevices.store(rc == ESP_OK ? count : -1);
+    if (rc == ESP_OK && count > 0 && addresses[0] != 0) {
+      Serial.printf("[USB] 已枚举设备补查: addr=%u\n", (unsigned)addresses[0]);
+      _openPendingAddr = addresses[0];
+      _openPending = true;
+      _initStage.store("list-found");
+    }
+  }
 
   // OTA 请求断开设备：先处理关闭，不执行恢复和新传输。
   if (_otaClosePending) {
@@ -193,6 +217,7 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
   switch (m->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
       Serial.printf("[USB] 检测到新设备，地址 %d\n", m->new_dev.address);
+      _newEvents.fetch_add(1);
       _initStage.store("new-dev");
       markStage("new-dev", __LINE__);
       // 仅置标志，真正打开延后到 task() 循环里做。
@@ -207,6 +232,7 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
       break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
       Serial.println("[USB] 设备已拔出");
+      _goneEvents.fetch_add(1);
       _initStage.store("dev-gone");
       markStage("dev-gone", __LINE__);
       if (m->dev_gone.dev_hdl != _deviceHandle) break;

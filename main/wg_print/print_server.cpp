@@ -844,15 +844,18 @@ void PrintServer::_publishDiag(const char* phase, bool force) {
   PrinterInfo pi;
   _printer.getPrinterInfoCopy(pi, 5);
   const auto& u = _printer.getUsbInfo();
-  char b[1600];
+  char b[2048];
   snprintf(b, sizeof(b),
-      "WG AI Print P2.1\n阶段: %s\nIP: %s\n打印机: %s\nUSB: %s %04X:%04X, 枚举 %u\n"
+      "WG AI Print P2.2\n阶段: %s\nIP: %s\n打印机: %s\nUSB: %s %04X:%04X, 枚举 %u\n"
+      "Host 事件循环: %u\n接入/拔出事件: %u / %u\n空闲补查设备数: %d (返回码 %d)\nHost/Client 最近异常码: %d / %d\n"
       "USB 初始化阶段: %s\nEP0 挂起: %s\nBulk IN: %s\nUSB OUT/IN: %02X/%02X\n纯透传: %s\n"
       "作业: %s\nTCP 已接收: %u B\nUSB 已发送(已知确认): %u B\nTCP 已回传: %u B\n"
       "作业已用时: %lu ms\n距最后 USB 成功: %lu ms\nUSB 错误: %u\n自动恢复: %u\n待回收传输: %u\n"
       "缓冲分配: %u B (单块 %u B)\n回传暂存: %u B\n累计成功: %u\n累计失败: %u\n拒绝连接: %u\n最近作业: %s\nUSB 最近错误: %s\nTCP 作业头(HEX): %s\nTCP 作业尾(HEX): %s\n",
       phase, WiFi.localIP().toString().c_str(), pi.mdl.c_str(), _printer.getStateText().c_str(),
       (unsigned)u.vid, (unsigned)u.pid, (unsigned)u.enumCount,
+      (unsigned)_printer.getHostPumps(), (unsigned)_printer.getNewEvents(), (unsigned)_printer.getGoneEvents(),
+      _printer.getListedDevices(), _printer.getListResult(), _printer.getLibError(), _printer.getClientError(),
       _printer.getInitStage(), _printer.isCtrlHung() ? "yes" : "no",
       _printer.isBidirActive() ? "active" : (_printer.isBidirStalled() ? "stalled" : "idle"),
       (unsigned)u.epOut, (unsigned)u.epIn, _printer.passthrough() ? "yes" : "no",

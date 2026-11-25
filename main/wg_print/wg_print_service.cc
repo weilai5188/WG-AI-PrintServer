@@ -16,12 +16,22 @@ std::mutex statusLock;
 std::string status="打印服务正在初始化";
 void setStatus(std::string s) { std::lock_guard<std::mutex> l(statusLock); status=std::move(s); }
 void netEvent(void*,esp_event_base_t,int32_t,void*) { netChanged=true; }
-void usbTask(void* arg) { auto& p=*static_cast<UsbPrinter*>(arg); for(;;){ p.task(); vTaskDelay(1); } }
+// Match upstream: USB Host on core 1, RAW network worker on core 0.
+std::atomic<int> usbInit{0};
+void usbTask(void* arg) {
+    auto& p=*static_cast<UsbPrinter*>(arg);
+    // Install PHY, interrupt and client on the same core that owns USB events.
+    if (!p.begin()) { usbInit.store(-1); vTaskDelete(nullptr); return; }
+    usbInit.store(1);
+    ESP_LOGI(TAG,"USB Host task ready on core %d", (int)xPortGetCoreID());
+    for (;;) { p.task(); vTaskDelay(1); }
+}
 void worker(void*) {
     static UsbPrinter printer;
     static PrintServer server(printer);
-    if(!printer.begin()) { setStatus("USB Host 初始化失败"); ESP_LOGE(TAG,"USB Host init failed"); vTaskDelete(nullptr); return; }
-    if(xTaskCreate(usbTask,"wg_usb_printer",USB_HOST_TASK_STACK_SIZE,&printer,USB_HOST_TASK_PRIORITY,nullptr)!=pdPASS){setStatus("USB 任务创建失败");vTaskDelete(nullptr);return;}
+    if(xTaskCreatePinnedToCore(usbTask,"wg_usb_printer",USB_HOST_TASK_STACK_SIZE,&printer,USB_HOST_TASK_PRIORITY,nullptr,1)!=pdPASS){setStatus("USB 任务创建失败");ESP_LOGE(TAG,"USB task allocation failed");vTaskDelete(nullptr);return;}
+    while (usbInit.load()==0) vTaskDelay(1);
+    if (usbInit.load()<0) { setStatus("USB Host 初始化失败"); ESP_LOGE(TAG,"USB Host init failed"); vTaskDelete(nullptr); return; }
     esp_event_handler_register(IP_EVENT,IP_EVENT_STA_GOT_IP,netEvent,nullptr);
     // Allow the existing Wi-Fi manager to connect and retain full ownership of Wi-Fi.
     for(;;){auto ip=WiFi.localIP().toString();if(ip!="0.0.0.0")break; vTaskDelay(pdMS_TO_TICKS(500));}
@@ -45,5 +55,5 @@ void worker(void*) {
 }
 void WgPrintStart(){
     McpServer::GetInstance().AddTool("self.printer.get_status","查询无线打印机连接、IP地址和数据传输状态；不代表纸张已打印完成",PropertyList(),[](const PropertyList&)->ReturnValue{std::lock_guard<std::mutex> l(statusLock);return status;});
-    if(xTaskCreate(worker,"wg_print_raw",PRINT_TASK_STACK_SIZE,nullptr,PRINT_TASK_PRIORITY,nullptr)!=pdPASS){setStatus("打印服务任务创建失败");ESP_LOGE(TAG,"Print task allocation failed");}
+    if(xTaskCreatePinnedToCore(worker,"wg_print_raw",PRINT_TASK_STACK_SIZE,nullptr,PRINT_TASK_PRIORITY,nullptr,PRINT_TASK_CORE)!=pdPASS){setStatus("打印服务任务创建失败");ESP_LOGE(TAG,"Print task allocation failed");}
 }
