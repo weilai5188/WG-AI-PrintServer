@@ -1,0 +1,168 @@
+#include "printer_db.h"
+
+// ============================================================
+//  实测机型表
+//
+//  填表原则：**只写有实测依据的条目**。没有证据的机型不要瞎标 flag，
+//  让它走 config.h 的全局默认值，比乱配置更安全。
+//
+//  字段：VID, PID, 兜底型号名, 行为特征位
+// ============================================================
+static const PrinterProfile PROFILES[] = {
+  // ---- EPSON ------------------------------------------------------------
+  // Stylus Photo 1390：对 ESP32 USB Host 的所有控制请求长时间 NAK，
+  // 而本 IDF 版本 usb_transfer_t::timeout_ms 无效、EP0 又无取消接口，
+  // 发了就是永久悬挂。枚举/识别阶段必须跳过一切控制传输，型号靠本表兜底。
+  //
+  // v2.6.4 关键修正（依据 192.168.11.205 实测快照，用户报"彩色相片直接出白纸"）：
+  //   headHex = "00 00 00 1B 01 40 45 4A 4C 20 31 32 38 34 2E 34 0A ..."
+  //     → \x00\x00\x00 + ESC 01 @EJL 1284.4 LF  —— Epson 的 "magic command"，
+  //       作用是让打印机**退出** 1284.4 packet mode，回到普通 ESC/P2 数据流。
+  //       （Epson 官方文档："Exit Packet Mode"，作业开头发一次，重复发无害。）
+  //   tailHex = "52 08 00 00 52 45 4D 4F 54 45 31 ... 4A 45 01 00 00 1B 00 00 00"
+  //     → "REMOTE1"(进入 ESC/P2 Remote Mode) + "JE BC=1 00"(flush 打印机缓冲)
+  //       + ESC 00 00 00(退出 Remote Mode)  —— **驱动自己发的完整收尾序列**。
+  //
+  //   所以固件必须一个字都不许加：
+  //     · 之前 Q_WANT_ESC_RESET 会在作业头插 ESC @ → 落在 magic command 中间，
+  //       破坏 Epson 的状态机初始化（彩色相片这种大作业尤其明显）。
+  //     · 之前 Q_TAIL_FF 会在作业尾插裸 FF → 驱动已经用 "JE BC=1 00" 收过尾了，
+  //       再插 FF 就是**在作业结束后又开一页** → 实测表现正是"纸直接出来了，
+  //       上面没内容"。而且裸 FF 落在 ESC/P2 命令流中间会被当成打印数据。
+  //   → 统一改为 Q_PASSTHROUGH：固件只做字节级透明转发。
+  //
+  //   顺带记一笔踩过的坑：v2.6.2 给自愈加了 force 软复位（绕过 Q_NO_CTRL），
+  //   结果 1390 每次都不应答，每次泄漏一个 transfer —— 实测
+  //   leakedXfers=85 恰好等于 recover=85，把 USB 驱动队列搞坏、
+  //   设备反复重枚举（enumCount 1→7），彩色大作业大量失败。v2.6.4 撤回。
+  //
+  // v2.9.6 修正（用户复现："单页直接出纸 + 多页错位乱码"）：
+  //   1390 上 _recoverLocked() 是**纯破坏性**的 ——
+  //     clsOk   恒 false（Q_NO_CTRL 把 EP0 软复位挡掉）
+  //     injectOk恒 false（Q_PASSTHROUGH 把 PJL/PCL 收尾序列挡掉）
+  //   真正执行到的只剩 usb_host_endpoint_halt + flush(_epOut)，
+  //   把已经排队/在飞的数据直接丢掉，然后函数返回 false（一次都没救回来）。
+  //   丢掉那一段会让 EJL 1284.4 的帧同步错位：
+  //     · 单页 → 整页光栅被截掉一截，打印机凑不齐 "JE BC=1 00" 的收尾上下文 → 空走出纸
+  //     · 多页 → 每个中断点留一个数据缺口，越往后越错位 → 错行 / 乱码
+  //   既然只在流里挖洞、从来没有收益，直接关掉自愈：
+  //   宁可让这份作业失败重打，也不要破坏数据流。与 v2.5.9 对 HP 的处理同源。
+  //   另加 Q_NO_ZLP：USB_XFER_CHUNK(8192) 必然是端点包长(64/512)的整数倍，
+  //   按 sendData() 的逻辑每 8KB 会补一个零长度包；纯透传机型连"传输边界"
+  //   都不该由固件制造 —— 驱动自己的封包流已经完整描述了一切。
+  {0x04B8, 0x0007, "Epson Stylus Photo 1390",
+   Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
+  {0x04B8, 0x0005, "Epson Stylus Photo 1390",
+   Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
+
+  // ---- HP ---------------------------------------------------------------
+  // 03F0:622A（装 HP LaserJet MFP M129-M134 PCLm-S 驱动）实测：
+  // - 作业开头塞 ESC @ 会打乱 @PJL 解析，收下全部数据却不出纸 → Q_NO_ESC_RESET
+  // - ⚠️ 作业结束**绝不能补 FF**（Q_TAIL_NONE）。v2.3.2 为了解决"最后一页压在缓冲里"
+  //   加过 Q_WANT_FORMFEED，但 PCLm 流的尾部自带 `%%EOF` 收尾，补的那个裸 FF 等于
+  //   在作业结束之后又开了一页却永远不给数据 —— 打印机常驻"正在打印中"、
+  //   后续作业全进不来，只能人工断电。这个坑 2.5.6 才定位到，别再改回去。
+  {0x03F0, 0x622A, "HP DeskJet / LaserJet",
+   Q_NO_ESC_RESET | Q_TAIL_NONE | Q_NO_FAIL_RECOVER},
+
+  // 惠普厂商级行为。Linux ipp-usb 源码里明确记录：部分惠普 MFP 的
+  // IPP-over-USB 走的是**非标准**接口组合 255/9/1（LaserJet MFP M426fdn、
+  // ColorLaserJet MFP M278-M281 等）。如果固件只认标准打印机类 0x07，
+  // 这些货真价实的打印机就会被当场拒掉——“不是打印机”。
+  // ⚠️ Q_NO_BIDIR：惠普在 v2.4.0 引入"常驻 Bulk IN 回读"后开始整族拒收数据
+  //    （03F0:622A 实测：每次首发即 `USB 传输失败 status=0`，30 秒内收不到任何回调）。
+  //    现象是打印任务没有一个字节能进打印机。怀疑这类主机型/GDI 机型固件缓冲很小，
+  //    持续挂着的 IN 请求会把它拖住。先整族关掉回读保住"能打"，后续逐机型甄别。
+  {0x03F0, PID_ANY, nullptr, Q_NO_ESC_RESET | Q_VENDOR_IFACE | Q_NO_BIDIR},
+
+  // ---- Brother ----------------------------------------------------------
+  {0x04F9, PID_ANY, nullptr, 0},
+
+  // ---- Canon ------------------------------------------------------------
+  // 佳能多数机型响应 Device ID，无需特殊处理；厂商级兜底仅用于
+  // 允许在缺少标准打印机类接口时尝试厂商私有批量接口。
+  {0x04A9, PID_ANY, nullptr, Q_VENDOR_IFACE},
+
+  // ---- Samsung / Kyocera / Xerox / Lexmark / OKI / Dell / Ricoh ---------
+  {0x04E8, PID_ANY, nullptr, 0},
+  {0x0482, PID_ANY, nullptr, 0},
+  {0x0924, PID_ANY, nullptr, 0},
+  {0x043D, PID_ANY, nullptr, 0},
+  {0x0390, PID_ANY, nullptr, 0},
+  {0x413C, PID_ANY, nullptr, 0},
+  {0x05CA, PID_ANY, nullptr, 0},
+
+  // ---- 热敏票据 / 标签机 -------------------------------------------------
+  // 票据机多数是单向或仅回 ACK，回读意义不大且部分固件会持续吐状态包。
+  {0x0A5F, PID_ANY, nullptr, 0},   // Zebra
+  {0x1203, PID_ANY, nullptr, 0},   // TSC
+  {0x0519, PID_ANY, nullptr, 0},   // Star
+  {0x1FC9, PID_ANY, nullptr, 0},   // Gprinter
+  {0x1A86, PID_ANY, nullptr, 0},   // QinHeng
+};
+static const size_t PROFILES_N = sizeof(PROFILES) / sizeof(PROFILES[0]);
+
+// 已知打印机厂商（Device ID 读不到时的制造商兜底，也是"能否接管私有接口"的凭据）
+struct VidEntry { uint16_t vid; const char* name; };
+static const VidEntry VID_TABLE[] = {
+  {0x04B8, "EPSON"},   {0x04F9, "Brother"},  {0x03F0, "HP"},
+  {0x04A9, "Canon"},   {0x413C, "Dell"},     {0x04E8, "Samsung"},
+  {0x043D, "Lexmark"}, {0x0924, "Xerox"},    {0x0482, "Kyocera"},
+  {0x05CA, "Ricoh"},   {0x06A3, "Konica Minolta"}, {0x0390, "OKI"},
+  {0x04DA, "Panasonic"}, {0x0930, "Toshiba"}, {0x04DD, "Sharp"},
+  {0x0A5F, "Zebra"},   {0x1203, "TSC"},      {0x0519, "Star"},
+  {0x1A86, "QinHeng"}, {0x1FC9, "Gprinter"}, {0x0483, "STMicro"},
+  {0x17EF, "Lenovo"},  {0x04C5, "Fujitsu"},
+};
+static const size_t VID_TABLE_N = sizeof(VID_TABLE) / sizeof(VID_TABLE[0]);
+
+// ---------------------------------------------------------------------------
+bool printerFlags(uint16_t vid, uint16_t pid, uint16_t* flagsOut) {
+  uint16_t f = 0;
+  bool found = false;
+  for (size_t i = 0; i < PROFILES_N; i++) {
+    if (PROFILES[i].vid != vid) continue;
+    if (PROFILES[i].pid == pid || PROFILES[i].pid == PID_ANY) {
+      f |= PROFILES[i].flags;
+      found = true;
+    }
+  }
+  if (flagsOut) *flagsOut = found ? f : 0;
+  return found;
+}
+
+const char* printerProfileName(uint16_t vid, uint16_t pid) {
+  for (size_t i = 0; i < PROFILES_N; i++) {
+    if (PROFILES[i].vid == vid && PROFILES[i].pid == pid && PROFILES[i].name) {
+      return PROFILES[i].name;
+    }
+  }
+  return nullptr;
+}
+
+bool printerTestFlag(uint16_t vid, uint16_t pid, uint16_t flag, bool defaultValue) {
+  uint16_t f = 0;
+  if (!printerFlags(vid, pid, &f)) return defaultValue;
+  return (f & flag) != 0;
+}
+
+bool printerTriFlag(uint16_t vid, uint16_t pid,
+                    uint16_t onFlag, uint16_t offFlag, bool defaultValue) {
+  uint16_t f = 0;
+  if (!printerFlags(vid, pid, &f)) return defaultValue;
+  if (f & onFlag)  return true;
+  if (f & offFlag) return false;
+  return defaultValue;
+}
+
+bool isKnownPrinterVendor(uint16_t vid) {
+  for (size_t i = 0; i < VID_TABLE_N; i++)
+    if (VID_TABLE[i].vid == vid) return true;
+  return false;
+}
+
+const char* guessVendorName(uint16_t vid) {
+  for (size_t i = 0; i < VID_TABLE_N; i++)
+    if (VID_TABLE[i].vid == vid) return VID_TABLE[i].name;
+  return nullptr;
+}
