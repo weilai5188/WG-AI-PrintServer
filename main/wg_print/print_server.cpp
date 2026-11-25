@@ -2,7 +2,7 @@
 // v2.6.3：优雅关闭 TCP 连接需要 shutdown(SHUT_WR)。NetworkClient 没暴露 shutdown()，
 // 但 fd() 是 public 的，直接对底层 socket 调用 lwIP 即可。
 #include <lwip/sockets.h>
-
+volatile bool g_otaBusy = false;
 static inline size_t szmin(size_t a, size_t b) { return a < b ? a : b; }
 
 static const size_t RX_SCRATCH = 512;
