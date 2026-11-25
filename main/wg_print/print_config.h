@@ -44,7 +44,7 @@
 #define USB_HOST_TASK_STACK_SIZE  10240
 #define USB_XFER_CHUNK            8192        // 单次 USB 批量传输最大字节
 #define USB_XFER_TIMEOUT_MS      30000       // 单块批量传输等待上限（打印机忙/走纸时会 NAK，必须留足余量）
-#define PRINT_CHUNK               16384       // 每次从 TCP 取多少字节交给 USB
+#define PRINT_CHUNK               8192       // 每次从 TCP 取多少字节交给 USB
 #define PRINT_BUFFER_SIZE         (256 * 1024)// PSRAM 缓冲
 #define STATUS_POLL_MS            2000        // IEEE1284 端口状态轮询间隔
 
@@ -122,8 +122,8 @@
 #define JOB_NODATA_TIMEOUT_MS     15000   // 连上后一直没收到任何数据 → 判定空连接，快速断开
 // RAW 9100 没有作业长度字段。Windows 发送完数据后会等服务端关闭，而旧固件又等 Windows
 // 先关闭，双方互等到约 60 秒，队列一直显示“正在打印”。已有数据全部下发后，TCP 连续静默
-// 1.5 秒即可认定本作业发送完毕，由服务端主动关闭连接。
-#define JOB_DATA_IDLE_END_MS       1500
+// 15 秒为保守兼容兜底（优先 TCP FIN，仍非严格作业边界），由服务端主动关闭连接。
+#define JOB_DATA_IDLE_END_MS      15000 // P2: conservative fallback when peer has not sent FIN
 // 发出 FIN 之后，等多久才 stop() 真正释放 fd。
 // 必须给 lwIP 留出把 FIN 放进发送队列并刷出去的时间 —— 紧跟着 stop() 会让
 // lwIP 在"还有未发送数据"的情况下直接 abort（发 RST 而不是 FIN），

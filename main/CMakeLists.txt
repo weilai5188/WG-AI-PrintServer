@@ -961,7 +961,8 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
 endif()
 
 if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD)
-    list(APPEND SOURCES "wg_print/usb_printer.cpp" "wg_print/printer_db.cpp" "wg_print/print_server.cpp" "wg_print/crashlog.cpp" "wg_print/wg_print_service.cc")
+    list(APPEND SOURCES "wg_print/usb_printer.cpp" "wg_print/printer_db.cpp" "wg_print/print_server.cpp" "wg_print/crashlog.cpp" "wg_print/wg_print_service.cc" "wg_print/print_diag.cc")
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_server)
 endif()
 
 idf_component_register(SRCS ${SOURCES}

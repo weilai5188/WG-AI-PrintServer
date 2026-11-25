@@ -55,6 +55,9 @@ static const PrinterProfile PROFILES[] = {
   {0x04B8, 0x0005, "Epson Stylus Photo 1390",
    Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
 
+  // WG P2: L1300 experimental transparent stream policy; keep Device ID and IN enabled.
+  {0x04B8, 0x0066, nullptr, Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
+
   // ---- HP ---------------------------------------------------------------
   // 03F0:622A（装 HP LaserJet MFP M129-M134 PCLm-S 驱动）实测：
   // - 作业开头塞 ESC @ 会打乱 @PJL 解析，收下全部数据却不出纸 → Q_NO_ESC_RESET

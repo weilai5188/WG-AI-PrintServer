@@ -27,7 +27,9 @@ public:
     void stop(){if(fd_>=0){lwip_close(fd_);fd_=-1;}}
     PrintIP remoteIP() const{return PrintIP(addr_);}
     int available() const{int n=0;return fd_>=0 && lwip_ioctl(fd_,FIONREAD,&n)==0 ? n:0;}
-    bool connected() const { if(fd_<0)return false; uint8_t b; int n=lwip_recv(fd_,&b,1,MSG_PEEK|MSG_DONTWAIT);return n>0||(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR)); }
+    // 1: data or still open, 0: orderly peer FIN, -1: socket error.
+    int peerState() const { if(fd_<0)return -1; uint8_t b; int n=lwip_recv(fd_,&b,1,MSG_PEEK|MSG_DONTWAIT); if(n>0)return 1; if(n==0)return 0; return (errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR)?1:-1; }
+    bool connected() const { return peerState()==1; }
     int read(uint8_t* b,size_t n){if(fd_<0)return 0;int r=lwip_recv(fd_,b,n,MSG_DONTWAIT);return r>0?r:0;}
     int availableForWrite() const {if(fd_<0)return 0;fd_set w;FD_ZERO(&w);FD_SET(fd_,&w);timeval tv{};return lwip_select(fd_+1,nullptr,&w,nullptr,&tv)>0?512:0;}
     size_t write(const uint8_t* b,size_t n){if(fd_<0)return 0;int r=lwip_send(fd_,b,n,MSG_DONTWAIT);return r>0?(size_t)r:0;}

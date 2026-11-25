@@ -2,7 +2,11 @@
 // v2.6.3：优雅关闭 TCP 连接需要 shutdown(SHUT_WR)。NetworkClient 没暴露 shutdown()，
 // 但 fd() 是 public 的，直接对底层 socket 调用 lwIP 即可。
 #include <lwip/sockets.h>
+#include "print_diag.h"
+
+// P1 linker fix retained. Actual XiaoZhi OTA integration is pending.
 volatile bool g_otaBusy = false;
+
 static inline size_t szmin(size_t a, size_t b) { return a < b ? a : b; }
 
 static const size_t RX_SCRATCH = 512;
@@ -37,7 +41,8 @@ bool PrintServer::begin() {
   }
   if (_rxScratch == nullptr) _rxScratch = (uint8_t*)malloc(RX_SCRATCH);
 
-  if (_buffer == nullptr) {
+  if (_buffer == nullptr || _rxScratch == nullptr) {
+    free(_buffer); _buffer = nullptr; free(_rxScratch); _rxScratch = nullptr;
     Serial.println("[Print] 缓冲区分配失败");
     return false;
   }
@@ -214,6 +219,7 @@ void PrintServer::_doNetworkUp() {
 
 void PrintServer::task() {
   if (_netUpReq) { _netUpReq = false; _doNetworkUp(); }
+  _publishDiag(_currentJob.active ? "TCP/USB transfer" : (_finStage != FIN_IDLE ? "Closing" : "Idle"));
 
   // 网页请求的测试页 / 复位在空闲时执行（会阻塞，绝不能在 Web 线程里做）
   _runPendingOps();
@@ -239,13 +245,14 @@ void PrintServer::task() {
     unsigned long durat  = now - _currentJob.startTime;
     if (_currentJob.bytesReceived == 0 && idle > JOB_NODATA_TIMEOUT_MS) {
       Serial.printf("[Print] 空连接超时（%lus 未收到数据），强制断开\n", idle / 1000);
-      _abortJob("连接后未收到数据（空连接超时）");
+      _currentJob.active = false;
+      _closeClient();
     } else if (_currentJob.bytesReceived > 0 &&
                _currentJob.bytesSent == _currentJob.bytesReceived &&
-               !_client.available() && idle > JOB_DATA_IDLE_END_MS) {
+               !_client.available() && idle > JOB_DATA_IDLE_END_MS && _client.peerState() == 1 && _backOffset == _backLen) {
       // RAW 9100 没有长度/EOJ 握手。Windows 发完会等服务端关闭，服务端若也等客户端
       // 关闭，就会双方互等到系统超时（实测约 60 秒），后续队列全部堵住。
-      // 已收字节全部成功交给 USB 且 TCP 静默一小段时间，判定本作业正常结束。
+      // 已收字节全部成功交给 USB 且 TCP 静默达到保守超时，判定本作业正常结束。
       //
       // v2.6.3：这里**主动结束作业**（记账 + 补 FF + 发 FIN），不再只 stop() 连接。
       // 老写法靠 "stop() 之后 connected() 变 false" 来触发下面的作业结束分支，
@@ -271,7 +278,7 @@ void PrintServer::task() {
     }
   }
 
-  if (_server.hasClient()) {
+  if (_finStage == FIN_IDLE && _closeSentMs == 0 && _server.hasClient()) {
     // 收尾进行中也接受新连接 —— 这是 v2.6.1 的关键改动。
     // 收尾只是对"已经打完的作业"做善后（补 FF、回读应答），不该拦住下一份作业：
     // Windows 队列在上一份完成后会立刻提交下一份，若此刻拒绝，Windows 要重试，
@@ -331,6 +338,7 @@ void PrintServer::task() {
       _client = _server.accept();
       if (!_client) _currentJob.active = wasActive;
       if (_client) {
+        _backLen = _backOffset = 0;
         _currentJob.active        = true;
         _currentJob.bytesReceived = 0;
         _currentJob.bytesSent     = 0;
@@ -360,12 +368,27 @@ void PrintServer::task() {
   // 同理，已发 FIN 等待释放的连接（_closeSentMs != 0）也不能再读 —— 它已经收工了。
   if (_finStage != FIN_IDLE || _closeSentMs != 0) {
     _pumpBackToClient();
-  } else if (_clientAlive() && _client.connected()) {
+  } else if (_clientAlive() && _currentJob.active && !_extJobActive) {
     _handleClient();
+    if (_currentJob.active && _clientAlive() && !_client.available()) {
+      int peer = _client.peerState();
+      if (peer < 0) {
+        _abortJob("TCP connection error");
+      } else if (peer == 0) {
+        if (_currentJob.bytesReceived == 0) { // port probe: not a print job
+          _currentJob.active = false;
+          _closeClient();
+        } else if (_currentJob.bytesSent == _currentJob.bytesReceived) {
+          _finishJobSuccess();
+        } else {
+          _abortJob("TCP FIN before all received bytes reached USB");
+        }
+      }
+    }
   } else {
     // 没有作业在跑：打印机若自由回吐状态数据也不能让它把缓冲塞满，定期清掉。
     if (_rxScratch) {
-      while (_printer.readData(_rxScratch, RX_SCRATCH) > 0) { /* 丢弃 */ }
+      for (int i=0; i<8 && _printer.readData(_rxScratch, RX_SCRATCH)>0; ++i) {}
     }
   }
 
@@ -455,22 +478,25 @@ size_t PrintServer::_pumpBackToClient() {
   // 用 fd() 而不是 connected() 判断：对端 shutdown(SHUT_WR) 之后 connected() 变 false，
   // 但它的**读方向还开着** —— 这正是 Windows 双向支持等待收尾应答的场景，
   // 这时候把回读丢掉就等于告诉电脑"打印机没反应"。
-  if (!_clientAlive() || _rxScratch == nullptr) return 0;
+  if (!_clientAlive() || _rxScratch == nullptr || _closeSentMs != 0) return 0;
   size_t total = 0;
   for (int i = 0; i < 8; i++) {          // 每轮最多搬 8 次，避免独占任务
-    int n = _printer.readData(_rxScratch, RX_SCRATCH);
-    if (n <= 0) break;
-    // 客户端不读数据时不硬写：lwIP 发送缓冲塞满后 write() 会一直阻塞，
-    // 网络抖动期间这足以把整个打印任务卡死（进而触发看门狗重启）。
-    // 状态回读丢几个字节无所谓，卡住才是灾难。
-    size_t space = (size_t)_client.availableForWrite();
-    if (space == 0) break;
-    if (space < (size_t)n) n = (int)space;
-    size_t wrote = _client.write(_rxScratch, (size_t)n);
-    if (wrote == 0) break;
+    if (_backOffset == _backLen) {
+      _backLen = _backOffset = 0;
+      if (_client.availableForWrite() <= 0) break;
+      int n = _printer.readData(_rxScratch, RX_SCRATCH);
+      if (n <= 0) break;
+      _backLen = static_cast<size_t>(n);
+    }
+    int space = _client.availableForWrite();
+    if (space <= 0) break;
+    size_t want = szmin(_backLen - _backOffset, static_cast<size_t>(space));
+    size_t wrote = _client.write(_rxScratch + _backOffset, want);
+    if (!wrote) break;
+    _backOffset += wrote;
     _currentJob.bytesReturned += wrote;
     total += wrote;
-    if (wrote < (size_t)n) break;
+    if (wrote < want) break;
   }
   return total;
 }
@@ -496,7 +522,7 @@ void PrintServer::_handleClient() {
     return;
   }
 
-  while (_client.available()) {
+  for (int rounds=0; rounds<8 && _client.available(); ++rounds) {
     // _bufferSize 可能因 PSRAM 分配失败退到 8KB，不能超过它（旧版会堆溢出）
     size_t want = szmin((size_t)_client.available(), szmin((size_t)PRINT_CHUNK, _bufferSize));
     size_t n = _client.read(_buffer, want);
@@ -507,8 +533,9 @@ void PrintServer::_handleClient() {
     _noteTail(_buffer, n);
     _noteHead(_buffer, n);
 
+    _publishDiag("USB OUT waiting", true);
     int sent = _printer.sendData(_buffer, n);
-    if (sent > 0) {
+    if (sent == static_cast<int>(n)) {
       _currentJob.bytesSent += (size_t)sent;
       // 一次 sendData 可能阻塞到 30 秒（打印机忙时 NAK），回来后立刻 Activity
       // 刷新 + 把这段时间里打印机回吐的数据搬回客户端。
@@ -518,7 +545,9 @@ void PrintServer::_handleClient() {
     } else {
       // 发送失败：终止本作业并复位打印机，绝不能把后半截残流继续塞给打印机，
       // 否则打印机状态机错位，重试时新作业被当成旧像素吞掉 → 错位 / 重影。
-      _abortJob("USB 发送错误 - " + _printer.getLastError());
+      if (sent > 0) _currentJob.bytesSent += static_cast<size_t>(sent);
+      _abortJob("USB 发送不完整或失败 - " + _printer.getLastError());
+      _publishDiag("USB OUT failed", true);
       return;
     }
 
@@ -650,7 +679,7 @@ void PrintServer::_abortJob(const String& reason) {
 // ---------------------------------------------------------------
 void PrintServer::_startFinish(bool needFf) {
   _finNeedFf  = needFf;
-  _finStartMs = millis();
+  _finHardStartMs = _finStartMs = millis();
   _finStage   = FIN_PUMP;
 }
 
@@ -664,8 +693,9 @@ void PrintServer::_runFinish() {
       // 老代码死等 300ms；这里改成"搬空后静默 300ms 就走"，每轮最多搬 8 次。
       // 另加 2 秒硬上限：打印机若一直吐数据，不能把收尾卡在这里。
       size_t moved = _pumpBackToClient();
-      if (moved > 0 && elapsed < 2000) _finStartMs = millis();
-      else if (elapsed >= 300) {
+      if (moved > 0) _finStartMs = millis();
+      if (millis() - _finHardStartMs >= 2000 || (elapsed >= 300 && moved == 0 && _backOffset == _backLen)) {
+        // bounded drain; cannot let constant IN traffic retain the socket forever
         _finStartMs = millis();
         _finStage   = FIN_TAIL;
       }
@@ -743,6 +773,7 @@ void PrintServer::_releaseClientIfDue() {
   if (_closeSentMs == 0) return;
   if (millis() - _closeSentMs < FIN_RELEASE_MS) return;
   if (_clientAlive()) _client.stop();
+  _backOffset = _backLen = 0;
   _closeSentMs = 0;
 }
 
@@ -790,4 +821,35 @@ bool PrintServer::printTestPage() {
   _failedJobs++;
   snprintf(_lastJob, sizeof(_lastJob), "测试页发送失败 - %s", _printer.getLastError().c_str());
   return false;
+}
+
+void PrintServer::_publishDiag(const char* phase, bool force) {
+  const unsigned long now = millis();
+  // Before USB wait publish immediately at first block, then throttle to 250 ms.
+  if (!force && now - _diagAt < 250) return;
+  // A blocked write must be visible immediately, even right after an idle snapshot.
+  // Only throttle subsequent writes within the same phase.
+  static bool lastWaiting = false;
+  bool waiting = strcmp(phase, "USB OUT waiting") == 0;
+  if (force && waiting && lastWaiting && now - _diagAt < 250) return;
+  lastWaiting = waiting;
+  _diagAt = now;
+  PrinterInfo pi;
+  _printer.getPrinterInfoCopy(pi, 5);
+  const auto& u = _printer.getUsbInfo();
+  char b[1600];
+  snprintf(b, sizeof(b),
+      "WG AI Print P2\n阶段: %s\nIP: %s\n打印机: %s\nUSB: %s %04X:%04X, 枚举 %u\n"
+      "作业: %s\nTCP 已接收: %u B\nUSB 已发送(已知确认): %u B\nTCP 已回传: %u B\n"
+      "作业已用时: %lu ms\n距最后 USB 成功: %lu ms\nUSB 错误: %u\n自动恢复: %u\n待回收传输: %u\n"
+      "缓冲分配: %u B (单块 %u B)\n回传暂存: %u B\n累计成功: %u\n累计失败: %u\n拒绝连接: %u\n最近作业: %s\nUSB 最近错误: %s\n",
+      phase, WiFi.localIP().toString().c_str(), pi.mdl.c_str(), _printer.getStateText().c_str(),
+      (unsigned)u.vid, (unsigned)u.pid, (unsigned)u.enumCount,
+      _currentJob.active ? "active" : "idle", (unsigned)_currentJob.bytesReceived,
+      (unsigned)_currentJob.bytesSent, (unsigned)_currentJob.bytesReturned,
+      _currentJob.startTime ? now - _currentJob.startTime : 0UL, _lastSentMs ? now - _lastSentMs : 0UL,
+      (unsigned)_printer.getTxErrors(), (unsigned)_printer.getRecoverCount(), (unsigned)_printer.getLeakedXfers(),
+      (unsigned)_bufferSize, (unsigned)PRINT_CHUNK, (unsigned)(_backLen - _backOffset),
+      (unsigned)_totalJobs, (unsigned)_failedJobs, (unsigned)_rejectedCount, _lastJob, _printer.getLastError().c_str());
+  WgPrintDiagPublish(b);
 }

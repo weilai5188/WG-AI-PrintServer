@@ -106,6 +106,9 @@ private:
 
   uint8_t* _buffer;
   size_t   _bufferSize;
+  size_t _backLen = 0, _backOffset = 0; // retain short TCP writes until next pump
+  unsigned long _diagAt = 0;
+  void _publishDiag(const char* phase, bool force = false);
   uint8_t* _rxScratch;      // 丢弃用临时缓冲（没有作业时要定期清掉打印机的自由回吐）
 
   // --- 作业收尾状态机（v2.6.1）---
@@ -122,6 +125,7 @@ private:
   };
   FinishStage  _finStage = FIN_IDLE;
   unsigned long _finStartMs = 0;
+  unsigned long _finHardStartMs = 0;
   bool _finNeedFf = false;
   // 已发出 FIN、fd 等待释放的时刻（0 = 没有待释放的连接）
   unsigned long _closeSentMs = 0;

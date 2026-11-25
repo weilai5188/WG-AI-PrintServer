@@ -944,7 +944,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
     _consecTimeouts = 0;   // 只要有一块成功，就认定打印机恢复正常
     _recoverTrigger = 0;
     total += sent;
-    if (sent == 0) break;   // 防呆，避免死循环
+    if (sent == 0) { rc = -4; break; } // no forward progress is not success
 
     // 数据长度是端点包长(MPS)整数倍时，补一个 ZLP 终止本次批量传输（见 _sendZlp 注释）。
     // 注意：必须用请求发出去的 chunk 判断，而非实际回传的 sent。

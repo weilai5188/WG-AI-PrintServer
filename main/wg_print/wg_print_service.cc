@@ -1,5 +1,6 @@
 #include "wg_print_service.h"
 #include "print_server.h"
+#include "print_diag.h"
 #include "mcp_server.h"
 #include "esp_log.h"
 #include "esp_event.h"
@@ -25,6 +26,7 @@ void worker(void*) {
     // Allow the existing Wi-Fi manager to connect and retain full ownership of Wi-Fi.
     for(;;){auto ip=WiFi.localIP().toString();if(ip!="0.0.0.0")break; vTaskDelay(pdMS_TO_TICKS(500));}
     if(!server.begin()){setStatus("RAW 9100 启动失败");vTaskDelete(nullptr);return;}
+    WgPrintDiagStart();
     netChanged=false;
     bool wdt=esp_task_wdt_add(nullptr)==ESP_OK;
     unsigned long last=0;
